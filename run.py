@@ -9,9 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ.setdefault("GDK_BACKEND", "x11")
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("DISPLAY", ":0")
 
 if shutil.which("xset") and os.environ.get("DISPLAY"):

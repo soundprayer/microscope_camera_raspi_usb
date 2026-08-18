@@ -30,13 +30,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ.setdefault("GDK_BACKEND", "x11")
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 os.environ.setdefault("DISPLAY", os.environ.get("DISPLAY", ":0"))
 
 import cv2
 import numpy as np
+
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
 try:
     cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
@@ -54,14 +57,15 @@ PRESETS = [
 ]
 FIT_MODES = ("cover", "contain", "stretch")
 HELP_LINES = [
-    "q Esc  wyjscie",
-    "s      zdjecie",
-    "f      pelny ekran",
-    "r      obrot 90",
-    "c      cover/contain/stretch",
-    "m      nastepna kamera",
-    "[ ]    rozdzielczosc",
-    "l      lista kamer",
+    "Esc / q   wyjscie",
+    "Alt+F4    wyjscie",
+    "s         zdjecie",
+    "f / F11   pelny ekran",
+    "r         obrot 90",
+    "c         cover/contain/stretch",
+    "m         nastepna kamera",
+    "[ ]       rozdzielczosc",
+    "l         lista kamer",
 ]
 
 
@@ -349,27 +353,81 @@ def find_camera(
     )
 
 
-def apply_window(name: str, fullscreen: bool, screen_w: int, screen_h: int) -> None:
-    flags = cv2.WINDOW_NORMAL
-    if hasattr(cv2, "WINDOW_FREERATIO"):
-        flags |= cv2.WINDOW_FREERATIO
-    if hasattr(cv2, "WINDOW_GUI_NORMAL"):
-        flags |= cv2.WINDOW_GUI_NORMAL
-    cv2.namedWindow(name, flags)
-    cv2.setWindowProperty(
-        name,
-        cv2.WND_PROP_FULLSCREEN,
-        cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
-    )
-    if hasattr(cv2, "WND_PROP_ASPECT_RATIO") and hasattr(cv2, "WINDOW_FREERATIO"):
-        cv2.setWindowProperty(name, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_FREERATIO)
-    if fullscreen:
-        cv2.resizeWindow(name, screen_w, screen_h)
-        cv2.moveWindow(name, 0, 0)
-        if hasattr(cv2, "WND_PROP_TOPMOST"):
-            cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1)
-    else:
-        cv2.resizeWindow(name, min(1280, screen_w), min(720, screen_h))
+class Screen:
+    """True exclusive fullscreen via SDL/pygame: no title bar, no OpenCV toolbar."""
+
+    def __init__(self, title: str, fullscreen: bool) -> None:
+        pygame.display.init()
+        pygame.display.set_caption(title)
+        self.title = title
+        self.fullscreen = fullscreen
+        self.surface = self._create()
+
+    def _create(self):
+        if self.fullscreen:
+            flags = pygame.FULLSCREEN | pygame.NOFRAME
+            try:
+                surface = pygame.display.set_mode((0, 0), flags)
+            except pygame.error:
+                width, height = detect_screen_size()
+                surface = pygame.display.set_mode((width, height), flags)
+        else:
+            surface = pygame.display.set_mode((1280, 720))
+        pygame.mouse.set_visible(not self.fullscreen)
+        return surface
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self.surface.get_size()
+
+    def set_fullscreen(self, fullscreen: bool) -> None:
+        self.fullscreen = fullscreen
+        self.surface = self._create()
+
+    def show(self, bgr: np.ndarray) -> None:
+        width, height = self.size
+        if bgr.shape[1] != width or bgr.shape[0] != height:
+            bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_LINEAR)
+        rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        frame = pygame.image.frombuffer(rgb, (width, height), "RGB")
+        self.surface.blit(frame, (0, 0))
+        pygame.display.flip()
+
+    def close(self) -> None:
+        pygame.mouse.set_visible(True)
+        pygame.display.quit()
+
+
+def poll_actions() -> list[str]:
+    actions = []
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            actions.append("quit")
+        elif event.type == pygame.KEYDOWN:
+            mods = pygame.key.get_mods()
+            if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                actions.append("quit")
+            elif event.key == pygame.K_F4 and (mods & pygame.KMOD_ALT):
+                actions.append("quit")
+            elif event.key in (pygame.K_f, pygame.K_F11):
+                actions.append("fullscreen")
+            elif event.key == pygame.K_s:
+                actions.append("snap")
+            elif event.key == pygame.K_r:
+                actions.append("rotate")
+            elif event.key == pygame.K_c:
+                actions.append("fit")
+            elif event.key == pygame.K_h:
+                actions.append("help")
+            elif event.key == pygame.K_l:
+                actions.append("list")
+            elif event.key == pygame.K_m:
+                actions.append("next")
+            elif event.key == pygame.K_LEFTBRACKET:
+                actions.append("res_down")
+            elif event.key == pygame.K_RIGHTBRACKET:
+                actions.append("res_up")
+    return actions
 
 
 def rotate_frame(frame, turns: int):
@@ -421,12 +479,15 @@ def draw_text_block(img: np.ndarray, lines: list[str], title: str = "") -> None:
 
 
 def main() -> int:
+    if pygame is None:
+        print("Brak pygame. Na Pi wpisz:  sudo apt-get install -y python3-pygame", file=sys.stderr)
+        return 1
+
     args = parse_args()
     devices = candidate_devices(args.device)
     use_mjpeg = not args.no_mjpeg
     width, height, fps = args.width, args.height, args.fps
     fit_mode = args.fit
-    screen_w, screen_h = detect_screen_size()
 
     try:
         cap, device = find_camera(devices, width, height, fps, use_mjpeg)
@@ -434,97 +495,99 @@ def main() -> int:
         print(exc, file=sys.stderr)
         return 1
 
+    fullscreen = not args.windowed
+    screen = Screen(args.window, fullscreen)
+    screen_w, screen_h = screen.size
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Display {screen_w}x{screen_h}  camera {device} {cam_w}x{cam_h}  fit={fit_mode}")
+    print("Wyjscie: Esc albo q  (albo Alt+F4)")
 
-    fullscreen = not args.windowed
-    apply_window(args.window, fullscreen, screen_w, screen_h)
     rotation = 0
     device_index = devices.index(device) if device in devices else 0
-    message = ""
-    message_until = 0.0
+    message = "Esc / q = wyjscie"
+    message_until = time.time() + 2.5
     show_help = False
     show_cameras = False
+    running = True
 
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            time.sleep(0.05)
-            continue
-
-        original = rotate_frame(frame, rotation)
-        target_w, target_h = (screen_w, screen_h) if fullscreen else (min(1280, screen_w), min(720, screen_h))
-        display = fit_to_screen(original, target_w, target_h, fit_mode)
-
-        if show_cameras:
-            lines = []
-            for item in list_video_devices():
-                if item["skip"] and not item["capture"]:
-                    continue
-                mark = ">" if item["path"] == device else " "
-                kind = "USB" if item["usb"] else ("CAP" if item["capture"] else "meta")
-                name = item["name"][:40]
-                lines.append(f"{mark} {item['path']}  {kind}  {name}")
-            if not lines:
-                lines = ["brak kamer USB", "v4l2-ctl --list-devices"]
-            lines.append("m = nastepna   l = schowaj")
-            draw_text_block(display, lines, "Kamery")
-        elif show_help:
-            draw_text_block(display, HELP_LINES, "Skroty")
-        elif time.time() < message_until and message:
-            draw_text_block(display, [message])
-
-        cv2.imshow(args.window, display)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key in (ord("q"), 27):
-            break
-        if key == ord("f"):
-            fullscreen = not fullscreen
-            screen_w, screen_h = detect_screen_size()
-            apply_window(args.window, fullscreen, screen_w, screen_h)
-        if key == ord("r"):
-            rotation = (rotation + 1) % 4
-            message, message_until = f"obrot {rotation * 90}", time.time() + 1.5
-        if key == ord("c"):
-            fit_mode = FIT_MODES[(FIT_MODES.index(fit_mode) + 1) % len(FIT_MODES)]
-            message, message_until = f"fit {fit_mode}", time.time() + 1.5
-        if key == ord("s"):
-            path = save_snapshot(original, args.snapshots)
-            message, message_until = f"zapis {path}", time.time() + 2.0
-        if key in (ord("h"), ord("?")):
-            show_help = not show_help
-            show_cameras = False
-        if key == ord("l"):
-            show_cameras = not show_cameras
-            show_help = False
-        if key in (ord("["), ord("]")):
-            width, height = next_preset(width, height, -1 if key == ord("[") else 1)
-            cap.release()
-            cap, device = find_camera([device], width, height, fps, use_mjpeg)
-            message, message_until = f"{width}x{height}", time.time() + 1.5
-        if key == ord("m"):
-            devices = candidate_devices("")
-            if not devices:
-                message, message_until = "brak kamer", time.time() + 1.5
+    try:
+        while running:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.05)
                 continue
-            cap.release()
-            device_index = (device_index + 1) % len(devices)
-            nxt = devices[device_index]
-            try:
-                cap, device = find_camera([nxt], width, height, fps, use_mjpeg)
-                message, message_until = f"{device}", time.time() + 1.5
-            except RuntimeError:
-                try:
-                    cap, device = find_camera(devices, width, height, fps, use_mjpeg)
-                    message, message_until = f"{device}", time.time() + 1.5
-                except RuntimeError as exc:
-                    print(exc, file=sys.stderr)
-                    return 1
 
-    cap.release()
-    cv2.destroyAllWindows()
+            original = rotate_frame(frame, rotation)
+            screen_w, screen_h = screen.size
+            display = fit_to_screen(original, screen_w, screen_h, fit_mode)
+
+            if show_cameras:
+                lines = []
+                for item in list_video_devices():
+                    if item["skip"] and not item["capture"]:
+                        continue
+                    mark = ">" if item["path"] == device else " "
+                    kind = "USB" if item["usb"] else ("CAP" if item["capture"] else "meta")
+                    name = item["name"][:40]
+                    lines.append(f"{mark} {item['path']}  {kind}  {name}")
+                if not lines:
+                    lines = ["brak kamer USB", "v4l2-ctl --list-devices"]
+                lines.append("m = nastepna   l = schowaj")
+                draw_text_block(display, lines, "Kamery")
+            elif show_help:
+                draw_text_block(display, HELP_LINES, "Skroty")
+            elif time.time() < message_until and message:
+                draw_text_block(display, [message])
+
+            screen.show(display)
+
+            for action in poll_actions():
+                if action == "quit":
+                    running = False
+                    break
+                if action == "fullscreen":
+                    fullscreen = not fullscreen
+                    screen.set_fullscreen(fullscreen)
+                elif action == "rotate":
+                    rotation = (rotation + 1) % 4
+                    message, message_until = f"obrot {rotation * 90}", time.time() + 1.5
+                elif action == "fit":
+                    fit_mode = FIT_MODES[(FIT_MODES.index(fit_mode) + 1) % len(FIT_MODES)]
+                    message, message_until = f"fit {fit_mode}", time.time() + 1.5
+                elif action == "snap":
+                    path = save_snapshot(original, args.snapshots)
+                    message, message_until = f"zapis {path}", time.time() + 2.0
+                elif action == "help":
+                    show_help = not show_help
+                    show_cameras = False
+                elif action == "list":
+                    show_cameras = not show_cameras
+                    show_help = False
+                elif action in ("res_down", "res_up"):
+                    width, height = next_preset(width, height, -1 if action == "res_down" else 1)
+                    cap.release()
+                    cap, device = find_camera([device], width, height, fps, use_mjpeg)
+                    message, message_until = f"{width}x{height}", time.time() + 1.5
+                elif action == "next":
+                    devices = candidate_devices("")
+                    if not devices:
+                        message, message_until = "brak kamer", time.time() + 1.5
+                        continue
+                    cap.release()
+                    device_index = (device_index + 1) % len(devices)
+                    nxt = devices[device_index]
+                    try:
+                        cap, device = find_camera([nxt], width, height, fps, use_mjpeg)
+                        message, message_until = f"{device}", time.time() + 1.5
+                    except RuntimeError:
+                        cap, device = find_camera(devices, width, height, fps, use_mjpeg)
+                        message, message_until = f"{device}", time.time() + 1.5
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+        screen.close()
     return 0
 
 

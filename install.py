@@ -15,6 +15,7 @@ from pathlib import Path
 PACKAGES = [
     "python3-opencv",
     "python3-numpy",
+    "python3-pygame",
     "v4l-utils",
     "ffmpeg",
     "unclutter",
