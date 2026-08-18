@@ -59,6 +59,12 @@ def prepare_session() -> None:
         )
 
 
-prepare_session()
-script = Path(__file__).resolve().parent / "camera_fullscreen.py"
-os.execv(sys.executable, [sys.executable, str(script), *sys.argv[1:]])
+def main(argv: list[str] | None = None) -> None:
+    prepare_session()
+    script = Path(__file__).resolve().parent / "camera_fullscreen.py"
+    args = sys.argv[1:] if argv is None else argv
+    os.execv(sys.executable, [sys.executable, str(script), *args])
+
+
+if __name__ == "__main__":
+    main()
