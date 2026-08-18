@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -28,10 +27,10 @@ PACKAGES = [
 
 
 def to_unix(path: Path) -> None:
-    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    path.write_bytes(data)
-    mode = path.stat().st_mode
-    path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    original = path.read_bytes()
+    data = original.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    if data != original:
+        path.write_bytes(data)
 
 
 def python_bin() -> str:
