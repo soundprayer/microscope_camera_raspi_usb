@@ -11,7 +11,8 @@ Keys:
   r        rotate 90 degrees clockwise
   c        cycle fit: cover / contain / stretch
   m        next camera
-  o        attach / cycle / off overlay camera
+  o        attach / cycle overlay camera
+  x / O    overlay off
   b        overlay blend mode
   - / +    overlay opacity
   [ / ]    lower / raise capture resolution
@@ -77,6 +78,7 @@ HELP_LINES = [
     "c         cover/contain/stretch",
     "m         nastepna kamera",
     "o         overlay kamera",
+    "x / Shift+o  overlay off",
     "b         tryb mix",
     "- +       sila mix (wszystkie tryby)",
     "[ ]       rozdzielczosc",
@@ -596,7 +598,12 @@ def poll_actions() -> list[str]:
             elif event.key == pygame.K_m:
                 actions.append("next")
             elif event.key == pygame.K_o:
-                actions.append("overlay")
+                if mods & pygame.KMOD_SHIFT:
+                    actions.append("overlay_off")
+                else:
+                    actions.append("overlay")
+            elif event.key == pygame.K_x:
+                actions.append("overlay_off")
             elif event.key == pygame.K_b:
                 actions.append("blend")
             elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS, pygame.K_UNDERSCORE):
@@ -679,7 +686,7 @@ def overlay_camera_list(
         lines.append(f"{mark} {item['path']}  {kind}  {name}")
     if not lines:
         lines = ["brak kamer USB", "v4l2-ctl --list-devices"]
-    lines.append("m = nastepna   o = overlay   l = schowaj")
+    lines.append("m = nastepna   o = overlay   x = overlay off   l = schowaj")
     draw_text_block(display, lines, "Kamery")
 
 
@@ -711,7 +718,7 @@ def main() -> int:
     cam_fps = cap.get(cv2.CAP_PROP_FPS) or fps
     print(f"Display {screen.size[0]}x{screen.size[1]}  camera {device} {cam_w}x{cam_h}  fit={fit_mode}")
     print("Wyjscie: Esc albo q  (albo Alt+F4)")
-    print("Overlay: o  mix: b  przezroczystosc: - +")
+    print("Overlay: o  wylacz: x  mix: b  sila: - +")
     print("Dla plynnosci wtykaj kamere w niebieski port USB 3.0 (Pi 4).")
 
     rotation = 0
@@ -931,6 +938,13 @@ def main() -> int:
                 elif action == "overlay":
                     note = cycle_overlay()
                     message, message_until = note, time.time() + 1.8
+                    dirty = True
+                elif action == "overlay_off":
+                    if overlay_device:
+                        stop_overlay()
+                        message, message_until = "overlay off", time.time() + 1.5
+                    else:
+                        message, message_until = "overlay juz off", time.time() + 1.2
                     dirty = True
                 elif action == "blend":
                     if not overlay_device:
