@@ -275,12 +275,13 @@ def open_capture(
     height: int,
     fps: int,
     use_mjpeg: bool,
+    check_formats: bool = True,
 ) -> cv2.VideoCapture | None:
     index = parse_device_index(device)
     if index is None:
         return None
     path = f"/dev/video{index}"
-    if os.path.exists(path) and not has_capture_formats(path):
+    if check_formats and os.path.exists(path) and not has_capture_formats(path):
         return None
 
     attempts = []
@@ -295,7 +296,10 @@ def open_capture(
             cap.release()
             continue
         configure_capture(cap, width, height, fps, mjpeg, set_size)
-        ok, frame = cap.read()
+        try:
+            ok, frame = cap.read()
+        except Exception:
+            ok, frame = False, None
         if ok and frame is not None:
             return cap
         cap.release()
@@ -339,7 +343,11 @@ class FrameGrabber:
 
     def _loop(self) -> None:
         while self._running:
-            ok, frame = self.cap.read()
+            try:
+                ok, frame = self.cap.read()
+            except Exception:
+                time.sleep(0.02)
+                continue
             if not ok or frame is None:
                 time.sleep(0.005)
                 continue
@@ -356,9 +364,10 @@ class FrameGrabber:
                 return last_seq, None
             return self.seq, self._frame.copy()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 3.0) -> bool:
         self._running = False
-        self._thread.join(timeout=1.2)
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
 
 class FrameScaler:
@@ -620,18 +629,80 @@ def main() -> int:
     clock = pygame.time.Clock()
     tick_hz = 60 if cam_fps >= 50 else 30
 
-    def reopen(new_cap: cv2.VideoCapture, new_device: str) -> None:
-        nonlocal cap, device, grabber, last_seq, last_raw, dirty, cam_w, cam_h
-        grabber.stop()
-        cap.release()
+    def attach(new_cap: cv2.VideoCapture, new_device: str) -> None:
+        nonlocal cap, device, grabber, last_seq, last_raw, dirty, cam_w, cam_h, width, height
         cap = new_cap
         device = new_device
         grabber = FrameGrabber(cap)
         last_seq = -1
         last_raw = None
         dirty = True
-        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or width
+        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or height
+        if cam_w >= 16 and cam_h >= 16:
+            width, height = cam_w, cam_h
+
+    def release_current() -> None:
+        grabber.stop()
+        cap.release()
+        time.sleep(0.2)
+
+    def recover(old_device: str, old_w: int, old_h: int) -> bool:
+        seen = []
+        for candidate in [old_device, *candidate_devices("")]:
+            if candidate in seen:
+                continue
+            seen.append(candidate)
+            new_cap = open_capture(candidate, old_w, old_h, fps, use_mjpeg, check_formats=False)
+            if new_cap is None:
+                new_cap = open_capture(candidate, old_w, old_h, fps, False, check_formats=False)
+            if new_cap is not None:
+                attach(new_cap, candidate)
+                return True
+        return False
+
+    def change_resolution(step: int) -> tuple[bool, str]:
+        old_device, old_w, old_h = device, width, height
+        wanted: list[tuple[int, int]] = []
+        w, h = old_w, old_h
+        for _ in range(len(PRESETS)):
+            w, h = next_preset(w, h, step)
+            if (w, h) not in wanted and (w, h) != (old_w, old_h):
+                wanted.append((w, h))
+        if not wanted:
+            wanted = [PRESETS[0]]
+        release_current()
+        try:
+            for w, h in wanted:
+                new_cap = open_capture(old_device, w, h, fps, use_mjpeg, check_formats=False)
+                if new_cap is not None:
+                    attach(new_cap, old_device)
+                    return True, f"{cam_w}x{cam_h}"
+            if recover(old_device, old_w, old_h):
+                return True, f"brak {wanted[0][0]}x{wanted[0][1]}"
+            return False, "kamera utracona"
+        except Exception as exc:
+            if recover(old_device, old_w, old_h):
+                return True, "blad rozdzielczosci"
+            return False, str(exc)
+
+    def switch_device(nxt: str, all_devices: list[str]) -> tuple[bool, str]:
+        old_device, old_w, old_h = device, width, height
+        release_current()
+        try:
+            order = [nxt] + [item for item in all_devices if item != nxt]
+            for candidate in order:
+                new_cap = open_capture(candidate, old_w, old_h, fps, use_mjpeg, check_formats=False)
+                if new_cap is not None:
+                    attach(new_cap, candidate)
+                    return True, candidate
+            if recover(old_device, old_w, old_h):
+                return True, f"nie mozna {nxt}"
+            return False, "kamera utracona"
+        except Exception as exc:
+            if recover(old_device, old_w, old_h):
+                return True, "blad kamery"
+            return False, str(exc)
 
     try:
         while running:
@@ -667,10 +738,12 @@ def main() -> int:
                         camera_list_cache = list_video_devices()
                     dirty = True
                 elif action in ("res_down", "res_up"):
-                    width, height = next_preset(width, height, -1 if action == "res_down" else 1)
-                    new_cap, new_device = find_camera([device], width, height, fps, use_mjpeg)
-                    reopen(new_cap, new_device)
-                    message, message_until = f"{width}x{height}", time.time() + 1.5
+                    step = -1 if action == "res_down" else 1
+                    ok, note = change_resolution(step)
+                    message, message_until = note, time.time() + 1.8
+                    dirty = True
+                    if not ok:
+                        print(note, file=sys.stderr)
                 elif action == "next":
                     devices = candidate_devices("")
                     if not devices:
@@ -679,14 +752,16 @@ def main() -> int:
                         continue
                     device_index = (device_index + 1) % len(devices)
                     nxt = devices[device_index]
-                    try:
-                        new_cap, new_device = find_camera([nxt], width, height, fps, use_mjpeg)
-                    except RuntimeError:
-                        new_cap, new_device = find_camera(devices, width, height, fps, use_mjpeg)
-                    reopen(new_cap, new_device)
-                    message, message_until = f"{device}", time.time() + 1.5
+                    ok, note = switch_device(nxt, devices)
+                    message, message_until = note, time.time() + 1.8
+                    dirty = True
+                    if not ok:
+                        print(note, file=sys.stderr)
 
-            seq, frame = grabber.get_if_new(last_seq)
+            try:
+                seq, frame = grabber.get_if_new(last_seq)
+            except Exception:
+                seq, frame = last_seq, None
             if frame is not None:
                 last_seq = seq
                 last_raw = frame
@@ -698,24 +773,36 @@ def main() -> int:
                 overlay_was = overlay_now
 
             if dirty and last_raw is not None:
-                original = rotate_frame(last_raw, rotation)
-                display = scaler.apply(original, screen.size[0], screen.size[1], fit_mode)
-                if show_cameras:
-                    overlay_camera_list(display, camera_list_cache, device)
-                elif show_help:
-                    draw_text_block(display, HELP_LINES, "Skroty")
-                elif overlay_now and message:
-                    draw_text_block(display, [message])
-                screen.show(display)
+                try:
+                    original = rotate_frame(last_raw, rotation)
+                    display = scaler.apply(original, screen.size[0], screen.size[1], fit_mode)
+                    if show_cameras:
+                        overlay_camera_list(display, camera_list_cache, device)
+                    elif show_help:
+                        draw_text_block(display, HELP_LINES, "Skroty")
+                    elif overlay_now and message:
+                        draw_text_block(display, [message])
+                    screen.show(display)
+                except Exception as exc:
+                    print(f"display: {exc}", file=sys.stderr)
                 dirty = False
 
             clock.tick(tick_hz)
     except KeyboardInterrupt:
         pass
     finally:
-        grabber.stop()
-        cap.release()
-        screen.close()
+        try:
+            grabber.stop()
+        except Exception:
+            pass
+        try:
+            cap.release()
+        except Exception:
+            pass
+        try:
+            screen.close()
+        except Exception:
+            pass
     return 0
 
 
