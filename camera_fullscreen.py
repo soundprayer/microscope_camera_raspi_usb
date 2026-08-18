@@ -11,6 +11,9 @@ Keys:
   r        rotate 90 degrees clockwise
   c        cycle fit: cover / contain / stretch
   m        next camera
+  o        attach / cycle / off overlay camera
+  b        overlay blend mode
+  - / +    overlay opacity
   [ / ]    lower / raise capture resolution
   h        help
   l        camera list
@@ -64,6 +67,7 @@ PRESETS = [
     (640, 480),
 ]
 FIT_MODES = ("cover", "contain", "stretch")
+BLEND_MODES = ("alpha", "screen", "multiply", "difference", "lighten", "pip")
 HELP_LINES = [
     "Esc / q   wyjscie",
     "Alt+F4    wyjscie",
@@ -72,6 +76,9 @@ HELP_LINES = [
     "r         obrot 90",
     "c         cover/contain/stretch",
     "m         nastepna kamera",
+    "o         overlay kamera",
+    "b         tryb mix",
+    "- +       przezroczystosc",
     "[ ]       rozdzielczosc",
     "l         lista kamer",
 ]
@@ -426,6 +433,57 @@ class FrameScaler:
         return canvas
 
 
+class OverlayMixer:
+    """Blend a second camera onto the main canvas. Reuses buffers."""
+
+    def __init__(self) -> None:
+        self._not_a: np.ndarray | None = None
+        self._not_b: np.ndarray | None = None
+        self._tmp: np.ndarray | None = None
+        self._pip: np.ndarray | None = None
+
+    def _bufs(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._tmp is None or self._tmp.shape != shape:
+            self._not_a = np.empty(shape, dtype=np.uint8)
+            self._not_b = np.empty(shape, dtype=np.uint8)
+            self._tmp = np.empty(shape, dtype=np.uint8)
+        assert self._not_a is not None and self._not_b is not None and self._tmp is not None
+        return self._not_a, self._not_b, self._tmp
+
+    def blend(self, base: np.ndarray, over: np.ndarray, mode: str, alpha: float) -> None:
+        if over.shape != base.shape:
+            over = cv2.resize(over, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_LINEAR)
+        alpha = min(0.9, max(0.1, float(alpha)))
+        if mode == "alpha":
+            cv2.addWeighted(base, 1.0 - alpha, over, alpha, 0, dst=base)
+        elif mode == "screen":
+            not_a, not_b, tmp = self._bufs(base.shape)
+            cv2.bitwise_not(base, dst=not_a)
+            cv2.bitwise_not(over, dst=not_b)
+            cv2.multiply(not_a, not_b, dst=tmp, scale=1.0 / 255.0)
+            cv2.bitwise_not(tmp, dst=base)
+        elif mode == "multiply":
+            cv2.multiply(base, over, dst=base, scale=1.0 / 255.0)
+        elif mode == "difference":
+            cv2.absdiff(base, over, dst=base)
+        elif mode == "lighten":
+            np.maximum(base, over, out=base)
+        elif mode == "pip":
+            self.pip(base, over)
+
+    def pip(self, base: np.ndarray, over: np.ndarray) -> None:
+        height, width = base.shape[:2]
+        pip_w = max(160, width // 3)
+        pip_h = max(90, height // 3)
+        x = max(0, width - pip_w - 24)
+        y = max(0, height - pip_h - 24)
+        if self._pip is None or self._pip.shape[0] != pip_h or self._pip.shape[1] != pip_w:
+            self._pip = np.empty((pip_h, pip_w, 3), dtype=np.uint8)
+        cv2.resize(over, (pip_w, pip_h), dst=self._pip, interpolation=cv2.INTER_AREA)
+        cv2.rectangle(base, (x - 2, y - 2), (x + pip_w + 1, y + pip_h + 1), (0, 220, 0), 2)
+        base[y : y + pip_h, x : x + pip_w] = self._pip
+
+
 class Screen:
     """Exclusive fullscreen via SDL/pygame: no title bar, vsync when available."""
 
@@ -516,6 +574,14 @@ def poll_actions() -> list[str]:
                 actions.append("list")
             elif event.key == pygame.K_m:
                 actions.append("next")
+            elif event.key == pygame.K_o:
+                actions.append("overlay")
+            elif event.key == pygame.K_b:
+                actions.append("blend")
+            elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS, pygame.K_UNDERSCORE):
+                actions.append("alpha_down")
+            elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                actions.append("alpha_up")
             elif event.key == pygame.K_LEFTBRACKET:
                 actions.append("res_down")
             elif event.key == pygame.K_RIGHTBRACKET:
@@ -571,18 +637,28 @@ def draw_text_block(img: np.ndarray, lines: list[str], title: str = "") -> None:
         y += line_h
 
 
-def overlay_camera_list(display: np.ndarray, items: list[dict], current: str) -> None:
+def overlay_camera_list(
+    display: np.ndarray,
+    items: list[dict],
+    current: str,
+    overlay: str = "",
+) -> None:
     lines = []
     for item in items:
         if item["skip"] and not item["capture"]:
             continue
-        mark = ">" if item["path"] == current else " "
+        if item["path"] == current:
+            mark = ">"
+        elif item["path"] == overlay:
+            mark = "O"
+        else:
+            mark = " "
         kind = "USB" if item["usb"] else ("CAP" if item["capture"] else "meta")
         name = item["name"][:40]
         lines.append(f"{mark} {item['path']}  {kind}  {name}")
     if not lines:
         lines = ["brak kamer USB", "v4l2-ctl --list-devices"]
-    lines.append("m = nastepna   l = schowaj")
+    lines.append("m = nastepna   o = overlay   l = schowaj")
     draw_text_block(display, lines, "Kamery")
 
 
@@ -606,12 +682,15 @@ def main() -> int:
     fullscreen = not args.windowed
     screen = Screen(args.window, fullscreen)
     scaler = FrameScaler()
+    overlay_scaler = FrameScaler()
+    mixer = OverlayMixer()
     grabber = FrameGrabber(cap)
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cam_fps = cap.get(cv2.CAP_PROP_FPS) or fps
     print(f"Display {screen.size[0]}x{screen.size[1]}  camera {device} {cam_w}x{cam_h}  fit={fit_mode}")
     print("Wyjscie: Esc albo q  (albo Alt+F4)")
+    print("Overlay: o  mix: b  przezroczystosc: - +")
     print("Dla plynnosci wtykaj kamere w niebieski port USB 3.0 (Pi 4).")
 
     rotation = 0
@@ -624,6 +703,13 @@ def main() -> int:
     running = True
     last_seq = -1
     last_raw: np.ndarray | None = None
+    overlay_cap: cv2.VideoCapture | None = None
+    overlay_grabber: FrameGrabber | None = None
+    overlay_device = ""
+    overlay_seq = -1
+    overlay_raw: np.ndarray | None = None
+    blend_mode = "alpha"
+    blend_alpha = 0.45
     dirty = True
     overlay_was = True
     clock = pygame.time.Clock()
@@ -650,7 +736,7 @@ def main() -> int:
     def recover(old_device: str, old_w: int, old_h: int) -> bool:
         seen = []
         for candidate in [old_device, *candidate_devices("")]:
-            if candidate in seen:
+            if candidate in seen or (overlay_device and candidate == overlay_device):
                 continue
             seen.append(candidate)
             new_cap = open_capture(candidate, old_w, old_h, fps, use_mjpeg, check_formats=False)
@@ -692,6 +778,8 @@ def main() -> int:
         try:
             order = [nxt] + [item for item in all_devices if item != nxt]
             for candidate in order:
+                if overlay_device and candidate == overlay_device:
+                    continue
                 new_cap = open_capture(candidate, old_w, old_h, fps, use_mjpeg, check_formats=False)
                 if new_cap is not None:
                     attach(new_cap, candidate)
@@ -703,6 +791,58 @@ def main() -> int:
             if recover(old_device, old_w, old_h):
                 return True, "blad kamery"
             return False, str(exc)
+
+    def stop_overlay() -> None:
+        nonlocal overlay_cap, overlay_grabber, overlay_device, overlay_raw, overlay_seq, dirty
+        if overlay_grabber is not None:
+            try:
+                overlay_grabber.stop()
+            except Exception:
+                pass
+        if overlay_cap is not None:
+            try:
+                overlay_cap.release()
+            except Exception:
+                pass
+        overlay_cap = None
+        overlay_grabber = None
+        overlay_device = ""
+        overlay_raw = None
+        overlay_seq = -1
+        dirty = True
+        time.sleep(0.15)
+
+    def attach_overlay(new_cap: cv2.VideoCapture, new_device: str) -> None:
+        nonlocal overlay_cap, overlay_grabber, overlay_device, overlay_raw, overlay_seq, dirty
+        overlay_cap = new_cap
+        overlay_device = new_device
+        overlay_grabber = FrameGrabber(new_cap)
+        overlay_raw = None
+        overlay_seq = -1
+        dirty = True
+
+    def cycle_overlay() -> str:
+        others = [item for item in candidate_devices("") if item != device]
+        if not others:
+            stop_overlay()
+            return "brak drugiej kamery"
+        if overlay_device:
+            idx = others.index(overlay_device) if overlay_device in others else -1
+            rest = others[idx + 1 :]
+            stop_overlay()
+            if not rest:
+                return "overlay off"
+            to_try = rest
+        else:
+            to_try = others
+        sizes = [(width, height), (1280, 720), (640, 480)]
+        for candidate in to_try:
+            for ow, oh in sizes:
+                new_cap = open_capture(candidate, ow, oh, fps, use_mjpeg, check_formats=False)
+                if new_cap is not None:
+                    attach_overlay(new_cap, candidate)
+                    return f"overlay {candidate}"
+        return "nie mozna overlay"
 
     try:
         while running:
@@ -746,17 +886,41 @@ def main() -> int:
                         print(note, file=sys.stderr)
                 elif action == "next":
                     devices = candidate_devices("")
-                    if not devices:
+                    mains = [item for item in devices if item != overlay_device] or devices
+                    if not mains:
                         message, message_until = "brak kamer", time.time() + 1.5
                         dirty = True
                         continue
-                    device_index = (device_index + 1) % len(devices)
-                    nxt = devices[device_index]
-                    ok, note = switch_device(nxt, devices)
+                    if device in mains:
+                        device_index = (mains.index(device) + 1) % len(mains)
+                    else:
+                        device_index = (device_index + 1) % len(mains)
+                    nxt = mains[device_index]
+                    ok, note = switch_device(nxt, mains)
                     message, message_until = note, time.time() + 1.8
                     dirty = True
                     if not ok:
                         print(note, file=sys.stderr)
+                elif action == "overlay":
+                    note = cycle_overlay()
+                    message, message_until = note, time.time() + 1.8
+                    dirty = True
+                elif action == "blend":
+                    if not overlay_device:
+                        message, message_until = "najpierw o = overlay", time.time() + 1.5
+                    else:
+                        blend_mode = BLEND_MODES[(BLEND_MODES.index(blend_mode) + 1) % len(BLEND_MODES)]
+                        extra = f" {int(round(blend_alpha * 100))}%" if blend_mode == "alpha" else ""
+                        message, message_until = f"mix {blend_mode}{extra}", time.time() + 1.5
+                    dirty = True
+                elif action in ("alpha_down", "alpha_up"):
+                    if not overlay_device:
+                        message, message_until = "najpierw o = overlay", time.time() + 1.5
+                    else:
+                        step = -0.1 if action == "alpha_down" else 0.1
+                        blend_alpha = min(0.9, max(0.1, round(blend_alpha + step, 2)))
+                        message, message_until = f"mix {int(round(blend_alpha * 100))}%", time.time() + 1.5
+                    dirty = True
 
             try:
                 seq, frame = grabber.get_if_new(last_seq)
@@ -767,6 +931,16 @@ def main() -> int:
                 last_raw = frame
                 dirty = True
 
+            if overlay_grabber is not None:
+                try:
+                    oseq, oframe = overlay_grabber.get_if_new(overlay_seq)
+                except Exception:
+                    oseq, oframe = overlay_seq, None
+                if oframe is not None:
+                    overlay_seq = oseq
+                    overlay_raw = oframe
+                    dirty = True
+
             overlay_now = show_cameras or show_help or (time.time() < message_until and bool(message))
             if overlay_now != overlay_was:
                 dirty = True
@@ -776,8 +950,16 @@ def main() -> int:
                 try:
                     original = rotate_frame(last_raw, rotation)
                     display = scaler.apply(original, screen.size[0], screen.size[1], fit_mode)
+                    if overlay_raw is not None and overlay_device:
+                        if blend_mode == "pip":
+                            mixer.pip(display, overlay_raw)
+                        else:
+                            over = overlay_scaler.apply(
+                                overlay_raw, screen.size[0], screen.size[1], fit_mode
+                            )
+                            mixer.blend(display, over, blend_mode, blend_alpha)
                     if show_cameras:
-                        overlay_camera_list(display, camera_list_cache, device)
+                        overlay_camera_list(display, camera_list_cache, device, overlay_device)
                     elif show_help:
                         draw_text_block(display, HELP_LINES, "Skroty")
                     elif overlay_now and message:
@@ -791,6 +973,10 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            stop_overlay()
+        except Exception:
+            pass
         try:
             grabber.stop()
         except Exception:
