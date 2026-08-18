@@ -78,7 +78,7 @@ HELP_LINES = [
     "m         nastepna kamera",
     "o         overlay kamera",
     "b         tryb mix",
-    "- +       przezroczystosc",
+    "- +       sila mix (wszystkie tryby)",
     "[ ]       rozdzielczosc",
     "l         lista kamer",
 ]
@@ -365,10 +365,13 @@ class FrameGrabber:
                     np.copyto(self._frame, frame)
                 self.seq += 1
 
-    def get_if_new(self, last_seq: int) -> tuple[int, np.ndarray | None]:
+    def get_if_new(self, last_seq: int, dest: np.ndarray | None = None) -> tuple[int, np.ndarray | None]:
         with self._lock:
             if self._frame is None or self.seq == last_seq:
                 return last_seq, None
+            if dest is not None and dest.shape == self._frame.shape:
+                np.copyto(dest, self._frame)
+                return self.seq, dest
             return self.seq, self._frame.copy()
 
     def stop(self, timeout: float = 3.0) -> bool:
@@ -389,18 +392,22 @@ class FrameScaler:
             self.canvas = np.zeros((height, width, 3), dtype=np.uint8)
         return self.canvas
 
-    def apply(self, frame: np.ndarray, screen_w: int, screen_h: int, mode: str) -> np.ndarray:
+    def apply(self, frame: np.ndarray, screen_w: int, screen_h: int, mode: str, fast: bool = False) -> np.ndarray:
         canvas = self._canvas(screen_h, screen_w)
         frame_h, frame_w = frame.shape[:2]
         if frame_w < 1 or frame_h < 1:
             canvas.fill(0)
             return canvas
 
+        downscale = screen_w < frame_w or screen_h < frame_h
+        interpolation = cv2.INTER_LINEAR if fast else (
+            cv2.INTER_AREA if downscale else cv2.INTER_LINEAR
+        )
+
         if mode == "stretch" or (frame_w == screen_w and frame_h == screen_h):
             if frame_w == screen_w and frame_h == screen_h:
                 np.copyto(canvas, frame)
                 return canvas
-            interpolation = cv2.INTER_AREA if (screen_w < frame_w or screen_h < frame_h) else cv2.INTER_LINEAR
             cv2.resize(frame, (screen_w, screen_h), dst=canvas, interpolation=interpolation)
             return canvas
 
@@ -411,7 +418,8 @@ class FrameScaler:
 
         new_w = max(1, int(round(frame_w * scale)))
         new_h = max(1, int(round(frame_h * scale)))
-        interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        if not fast:
+            interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
         if self.resized is None or self.resized.shape[0] != new_h or self.resized.shape[1] != new_w:
             self.resized = np.empty((new_h, new_w, 3), dtype=np.uint8)
         cv2.resize(frame, (new_w, new_h), dst=self.resized, interpolation=interpolation)
@@ -439,16 +447,22 @@ class OverlayMixer:
     def __init__(self) -> None:
         self._not_a: np.ndarray | None = None
         self._not_b: np.ndarray | None = None
-        self._tmp: np.ndarray | None = None
+        self._effect: np.ndarray | None = None
+        self._out: np.ndarray | None = None
         self._pip: np.ndarray | None = None
 
     def _bufs(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._tmp is None or self._tmp.shape != shape:
+        if self._effect is None or self._effect.shape != shape:
             self._not_a = np.empty(shape, dtype=np.uint8)
             self._not_b = np.empty(shape, dtype=np.uint8)
-            self._tmp = np.empty(shape, dtype=np.uint8)
-        assert self._not_a is not None and self._not_b is not None and self._tmp is not None
-        return self._not_a, self._not_b, self._tmp
+            self._effect = np.empty(shape, dtype=np.uint8)
+        assert self._not_a is not None and self._not_b is not None and self._effect is not None
+        return self._not_a, self._not_b, self._effect
+
+    def output(self, shape: tuple[int, ...]) -> np.ndarray:
+        if self._out is None or self._out.shape != shape:
+            self._out = np.empty(shape, dtype=np.uint8)
+        return self._out
 
     def blend(self, base: np.ndarray, over: np.ndarray, mode: str, alpha: float) -> None:
         if over.shape != base.shape:
@@ -456,22 +470,28 @@ class OverlayMixer:
         alpha = min(0.9, max(0.1, float(alpha)))
         if mode == "alpha":
             cv2.addWeighted(base, 1.0 - alpha, over, alpha, 0, dst=base)
-        elif mode == "screen":
-            not_a, not_b, tmp = self._bufs(base.shape)
+            return
+        if mode == "pip":
+            self.pip(base, over, alpha)
+            return
+
+        not_a, not_b, effect = self._bufs(base.shape)
+        if mode == "screen":
             cv2.bitwise_not(base, dst=not_a)
             cv2.bitwise_not(over, dst=not_b)
-            cv2.multiply(not_a, not_b, dst=tmp, scale=1.0 / 255.0)
-            cv2.bitwise_not(tmp, dst=base)
+            cv2.multiply(not_a, not_b, dst=effect, scale=1.0 / 255.0)
+            cv2.bitwise_not(effect, dst=effect)
         elif mode == "multiply":
-            cv2.multiply(base, over, dst=base, scale=1.0 / 255.0)
+            cv2.multiply(base, over, dst=effect, scale=1.0 / 255.0)
         elif mode == "difference":
-            cv2.absdiff(base, over, dst=base)
+            cv2.absdiff(base, over, dst=effect)
         elif mode == "lighten":
-            np.maximum(base, over, out=base)
-        elif mode == "pip":
-            self.pip(base, over)
+            np.maximum(base, over, out=effect)
+        else:
+            np.copyto(effect, over)
+        cv2.addWeighted(base, 1.0 - alpha, effect, alpha, 0, dst=base)
 
-    def pip(self, base: np.ndarray, over: np.ndarray) -> None:
+    def pip(self, base: np.ndarray, over: np.ndarray, alpha: float = 0.9) -> None:
         height, width = base.shape[:2]
         pip_w = max(160, width // 3)
         pip_h = max(90, height // 3)
@@ -479,9 +499,10 @@ class OverlayMixer:
         y = max(0, height - pip_h - 24)
         if self._pip is None or self._pip.shape[0] != pip_h or self._pip.shape[1] != pip_w:
             self._pip = np.empty((pip_h, pip_w, 3), dtype=np.uint8)
-        cv2.resize(over, (pip_w, pip_h), dst=self._pip, interpolation=cv2.INTER_AREA)
+        cv2.resize(over, (pip_w, pip_h), dst=self._pip, interpolation=cv2.INTER_LINEAR)
+        roi = base[y : y + pip_h, x : x + pip_w]
+        cv2.addWeighted(roi, 1.0 - alpha, self._pip, alpha, 0, dst=roi)
         cv2.rectangle(base, (x - 2, y - 2), (x + pip_w + 1, y + pip_h + 1), (0, 220, 0), 2)
-        base[y : y + pip_h, x : x + pip_w] = self._pip
 
 
 class Screen:
@@ -708,6 +729,10 @@ def main() -> int:
     overlay_device = ""
     overlay_seq = -1
     overlay_raw: np.ndarray | None = None
+    main_cache_seq = -1
+    over_cache_seq = -1
+    main_cache_key = None
+    over_cache_key = None
     blend_mode = "alpha"
     blend_alpha = 0.45
     dirty = True
@@ -835,13 +860,15 @@ def main() -> int:
             to_try = rest
         else:
             to_try = others
-        sizes = [(width, height), (1280, 720), (640, 480)]
+        sizes = [(1280, 720), (640, 480), (width, height)]
         for candidate in to_try:
             for ow, oh in sizes:
                 new_cap = open_capture(candidate, ow, oh, fps, use_mjpeg, check_formats=False)
                 if new_cap is not None:
                     attach_overlay(new_cap, candidate)
-                    return f"overlay {candidate}"
+                    got_w = int(new_cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or ow
+                    got_h = int(new_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or oh
+                    return f"overlay {candidate} {got_w}x{got_h}"
         return "nie mozna overlay"
 
     try:
@@ -910,7 +937,7 @@ def main() -> int:
                         message, message_until = "najpierw o = overlay", time.time() + 1.5
                     else:
                         blend_mode = BLEND_MODES[(BLEND_MODES.index(blend_mode) + 1) % len(BLEND_MODES)]
-                        extra = f" {int(round(blend_alpha * 100))}%" if blend_mode == "alpha" else ""
+                        extra = f" {int(round(blend_alpha * 100))}%"
                         message, message_until = f"mix {blend_mode}{extra}", time.time() + 1.5
                     dirty = True
                 elif action in ("alpha_down", "alpha_up"):
@@ -919,11 +946,11 @@ def main() -> int:
                     else:
                         step = -0.1 if action == "alpha_down" else 0.1
                         blend_alpha = min(0.9, max(0.1, round(blend_alpha + step, 2)))
-                        message, message_until = f"mix {int(round(blend_alpha * 100))}%", time.time() + 1.5
+                        message, message_until = f"mix {blend_mode} {int(round(blend_alpha * 100))}%", time.time() + 1.5
                     dirty = True
 
             try:
-                seq, frame = grabber.get_if_new(last_seq)
+                seq, frame = grabber.get_if_new(last_seq, last_raw)
             except Exception:
                 seq, frame = last_seq, None
             if frame is not None:
@@ -933,7 +960,7 @@ def main() -> int:
 
             if overlay_grabber is not None:
                 try:
-                    oseq, oframe = overlay_grabber.get_if_new(overlay_seq)
+                    oseq, oframe = overlay_grabber.get_if_new(overlay_seq, overlay_raw)
                 except Exception:
                     oseq, oframe = overlay_seq, None
                 if oframe is not None:
@@ -948,23 +975,41 @@ def main() -> int:
 
             if dirty and last_raw is not None:
                 try:
-                    original = rotate_frame(last_raw, rotation)
-                    display = scaler.apply(original, screen.size[0], screen.size[1], fit_mode)
-                    if overlay_raw is not None and overlay_device:
+                    screen_w, screen_h = screen.size
+                    main_key = (screen_w, screen_h, fit_mode, rotation)
+                    if main_cache_seq != last_seq or main_cache_key != main_key:
+                        original = rotate_frame(last_raw, rotation)
+                        scaler.apply(original, screen_w, screen_h, fit_mode)
+                        main_cache_seq = last_seq
+                        main_cache_key = main_key
+                    display = scaler.canvas
+                    if display is not None and overlay_raw is not None and overlay_device:
                         if blend_mode == "pip":
-                            mixer.pip(display, overlay_raw)
+                            out = mixer.output(display.shape)
+                            np.copyto(out, display)
+                            mixer.pip(out, overlay_raw, blend_alpha)
+                            display = out
                         else:
-                            over = overlay_scaler.apply(
-                                overlay_raw, screen.size[0], screen.size[1], fit_mode
-                            )
-                            mixer.blend(display, over, blend_mode, blend_alpha)
-                    if show_cameras:
-                        overlay_camera_list(display, camera_list_cache, device, overlay_device)
-                    elif show_help:
-                        draw_text_block(display, HELP_LINES, "Skroty")
-                    elif overlay_now and message:
-                        draw_text_block(display, [message])
-                    screen.show(display)
+                            over_key = (screen_w, screen_h, fit_mode)
+                            if over_cache_seq != overlay_seq or over_cache_key != over_key:
+                                overlay_scaler.apply(
+                                    overlay_raw, screen_w, screen_h, fit_mode, fast=True
+                                )
+                                over_cache_seq = overlay_seq
+                                over_cache_key = over_key
+                            if overlay_scaler.canvas is not None:
+                                out = mixer.output(display.shape)
+                                np.copyto(out, display)
+                                mixer.blend(out, overlay_scaler.canvas, blend_mode, blend_alpha)
+                                display = out
+                    if display is not None:
+                        if show_cameras:
+                            overlay_camera_list(display, camera_list_cache, device, overlay_device)
+                        elif show_help:
+                            draw_text_block(display, HELP_LINES, "Skroty")
+                        elif overlay_now and message:
+                            draw_text_block(display, [message])
+                        screen.show(display)
                 except Exception as exc:
                     print(f"display: {exc}", file=sys.stderr)
                 dirty = False
