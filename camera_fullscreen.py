@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fullscreen USB camera preview for Raspberry Pi 4B.
 
-The camera frame is always scaled to the real display size, so the
-window fills HDMI regardless of camera resolution or monitor.
+Capture runs on a side thread (latest frame only). Display reuses buffers,
+uses MJPEG, and syncs to the monitor so 720p/1080p HDMI stays smooth.
 
 Keys:
   q / Esc  quit
@@ -12,8 +12,8 @@ Keys:
   c        cycle fit: cover / contain / stretch
   m        next camera
   [ / ]    lower / raise capture resolution
-  h / ?    help
-  l        camera list (secret)
+  h        help
+  l        camera list
 """
 
 from __future__ import annotations
@@ -25,12 +25,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+os.environ.setdefault("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0")
 os.environ.setdefault("DISPLAY", os.environ.get("DISPLAY", ":0"))
 
 import cv2
@@ -43,6 +45,12 @@ except ImportError:
 
 try:
     cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+cv2.setUseOptimized(True)
+try:
+    cv2.setNumThreads(2)
 except Exception:
     pass
 
@@ -135,41 +143,6 @@ def detect_screen_size() -> tuple[int, int]:
         pass
 
     return 1920, 1080
-
-
-def fit_to_screen(frame: np.ndarray, screen_w: int, screen_h: int, mode: str) -> np.ndarray:
-    """Scale any camera frame onto the full display."""
-    frame_h, frame_w = frame.shape[:2]
-    canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-    if frame_w < 1 or frame_h < 1 or screen_w < 1 or screen_h < 1:
-        return canvas
-
-    if mode == "stretch":
-        interpolation = cv2.INTER_AREA if (screen_w < frame_w or screen_h < frame_h) else cv2.INTER_LINEAR
-        return cv2.resize(frame, (screen_w, screen_h), interpolation=interpolation)
-
-    if mode == "cover":
-        scale = max(screen_w / frame_w, screen_h / frame_h)
-    else:
-        scale = min(screen_w / frame_w, screen_h / frame_h)
-
-    new_w = max(1, int(round(frame_w * scale)))
-    new_h = max(1, int(round(frame_h * scale)))
-    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=interpolation)
-
-    if mode == "cover":
-        x0 = max(0, (new_w - screen_w) // 2)
-        y0 = max(0, (new_h - screen_h) // 2)
-        crop = resized[y0 : y0 + screen_h, x0 : x0 + screen_w]
-        ch, cw = crop.shape[:2]
-        canvas[0:ch, 0:cw] = crop
-        return canvas
-
-    x = max(0, (screen_w - new_w) // 2)
-    y = max(0, (screen_h - new_h) // 2)
-    canvas[y : y + new_h, x : x + new_w] = resized
-    return canvas
 
 
 def video_nodes() -> list[str]:
@@ -303,7 +276,6 @@ def open_capture(
     fps: int,
     use_mjpeg: bool,
 ) -> cv2.VideoCapture | None:
-    # OpenCV V4L2 on Raspberry Pi cannot open by path name, only by index.
     index = parse_device_index(device)
     if index is None:
         return None
@@ -353,27 +325,136 @@ def find_camera(
     )
 
 
+class FrameGrabber:
+    """Read USB frames off the UI thread; keep only the latest one."""
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self.cap = cap
+        self._lock = threading.Lock()
+        self._frame: np.ndarray | None = None
+        self.seq = 0
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name="camera-grab", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while self._running:
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                if self._frame is None or self._frame.shape != frame.shape:
+                    self._frame = frame.copy()
+                else:
+                    np.copyto(self._frame, frame)
+                self.seq += 1
+
+    def get_if_new(self, last_seq: int) -> tuple[int, np.ndarray | None]:
+        with self._lock:
+            if self._frame is None or self.seq == last_seq:
+                return last_seq, None
+            return self.seq, self._frame.copy()
+
+    def stop(self) -> None:
+        self._running = False
+        self._thread.join(timeout=1.2)
+
+
+class FrameScaler:
+    """Scale camera frames onto a reused HDMI-sized canvas."""
+
+    def __init__(self) -> None:
+        self.canvas: np.ndarray | None = None
+        self.resized: np.ndarray | None = None
+
+    def _canvas(self, height: int, width: int) -> np.ndarray:
+        if self.canvas is None or self.canvas.shape[0] != height or self.canvas.shape[1] != width:
+            self.canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        return self.canvas
+
+    def apply(self, frame: np.ndarray, screen_w: int, screen_h: int, mode: str) -> np.ndarray:
+        canvas = self._canvas(screen_h, screen_w)
+        frame_h, frame_w = frame.shape[:2]
+        if frame_w < 1 or frame_h < 1:
+            canvas.fill(0)
+            return canvas
+
+        if mode == "stretch" or (frame_w == screen_w and frame_h == screen_h):
+            if frame_w == screen_w and frame_h == screen_h:
+                np.copyto(canvas, frame)
+                return canvas
+            interpolation = cv2.INTER_AREA if (screen_w < frame_w or screen_h < frame_h) else cv2.INTER_LINEAR
+            cv2.resize(frame, (screen_w, screen_h), dst=canvas, interpolation=interpolation)
+            return canvas
+
+        if mode == "cover":
+            scale = max(screen_w / frame_w, screen_h / frame_h)
+        else:
+            scale = min(screen_w / frame_w, screen_h / frame_h)
+
+        new_w = max(1, int(round(frame_w * scale)))
+        new_h = max(1, int(round(frame_h * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        if self.resized is None or self.resized.shape[0] != new_h or self.resized.shape[1] != new_w:
+            self.resized = np.empty((new_h, new_w, 3), dtype=np.uint8)
+        cv2.resize(frame, (new_w, new_h), dst=self.resized, interpolation=interpolation)
+
+        if mode == "cover":
+            x0 = max(0, (new_w - screen_w) // 2)
+            y0 = max(0, (new_h - screen_h) // 2)
+            crop = self.resized[y0 : y0 + screen_h, x0 : x0 + screen_w]
+            ch, cw = crop.shape[:2]
+            if ch != screen_h or cw != screen_w:
+                canvas.fill(0)
+            canvas[0:ch, 0:cw] = crop
+            return canvas
+
+        canvas.fill(0)
+        x = max(0, (screen_w - new_w) // 2)
+        y = max(0, (screen_h - new_h) // 2)
+        canvas[y : y + new_h, x : x + new_w] = self.resized
+        return canvas
+
+
 class Screen:
-    """True exclusive fullscreen via SDL/pygame: no title bar, no OpenCV toolbar."""
+    """Exclusive fullscreen via SDL/pygame: no title bar, vsync when available."""
 
     def __init__(self, title: str, fullscreen: bool) -> None:
-        pygame.display.init()
+        pygame.init()
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
         pygame.display.set_caption(title)
+        try:
+            pygame.display.set_allow_screensaver(False)
+        except Exception:
+            pass
         self.title = title
         self.fullscreen = fullscreen
+        self._rgb: np.ndarray | None = None
         self.surface = self._create()
 
+    def _set_mode(self, size: tuple[int, int], flags: int):
+        try:
+            return pygame.display.set_mode(size, flags, vsync=1)
+        except TypeError:
+            return pygame.display.set_mode(size, flags)
+
     def _create(self):
+        flags = pygame.DOUBLEBUF
         if self.fullscreen:
-            flags = pygame.FULLSCREEN | pygame.NOFRAME
+            flags |= pygame.FULLSCREEN | pygame.NOFRAME
             try:
-                surface = pygame.display.set_mode((0, 0), flags)
+                surface = self._set_mode((0, 0), flags)
             except pygame.error:
                 width, height = detect_screen_size()
-                surface = pygame.display.set_mode((width, height), flags)
+                surface = self._set_mode((width, height), flags)
         else:
-            surface = pygame.display.set_mode((1280, 720))
+            surface = self._set_mode((1280, 720), flags)
         pygame.mouse.set_visible(not self.fullscreen)
+        self._rgb = None
         return surface
 
     @property
@@ -388,14 +469,17 @@ class Screen:
         width, height = self.size
         if bgr.shape[1] != width or bgr.shape[0] != height:
             bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_LINEAR)
-        rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        frame = pygame.image.frombuffer(rgb, (width, height), "RGB")
+        if self._rgb is None or self._rgb.shape[0] != height or self._rgb.shape[1] != width:
+            self._rgb = np.empty((height, width, 3), dtype=np.uint8)
+        cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB, dst=self._rgb)
+        frame = pygame.image.frombuffer(self._rgb, (width, height), "RGB")
         self.surface.blit(frame, (0, 0))
         pygame.display.flip()
 
     def close(self) -> None:
         pygame.mouse.set_visible(True)
         pygame.display.quit()
+        pygame.quit()
 
 
 def poll_actions() -> list[str]:
@@ -478,6 +562,21 @@ def draw_text_block(img: np.ndarray, lines: list[str], title: str = "") -> None:
         y += line_h
 
 
+def overlay_camera_list(display: np.ndarray, items: list[dict], current: str) -> None:
+    lines = []
+    for item in items:
+        if item["skip"] and not item["capture"]:
+            continue
+        mark = ">" if item["path"] == current else " "
+        kind = "USB" if item["usb"] else ("CAP" if item["capture"] else "meta")
+        name = item["name"][:40]
+        lines.append(f"{mark} {item['path']}  {kind}  {name}")
+    if not lines:
+        lines = ["brak kamer USB", "v4l2-ctl --list-devices"]
+    lines.append("m = nastepna   l = schowaj")
+    draw_text_block(display, lines, "Kamery")
+
+
 def main() -> int:
     if pygame is None:
         print("Brak pygame. Na Pi wpisz:  sudo apt-get install -y python3-pygame", file=sys.stderr)
@@ -497,11 +596,14 @@ def main() -> int:
 
     fullscreen = not args.windowed
     screen = Screen(args.window, fullscreen)
-    screen_w, screen_h = screen.size
+    scaler = FrameScaler()
+    grabber = FrameGrabber(cap)
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Display {screen_w}x{screen_h}  camera {device} {cam_w}x{cam_h}  fit={fit_mode}")
+    cam_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+    print(f"Display {screen.size[0]}x{screen.size[1]}  camera {device} {cam_w}x{cam_h}  fit={fit_mode}")
     print("Wyjscie: Esc albo q  (albo Alt+F4)")
+    print("Dla plynnosci wtykaj kamere w niebieski port USB 3.0 (Pi 4).")
 
     rotation = 0
     device_index = devices.index(device) if device in devices else 0
@@ -509,39 +611,30 @@ def main() -> int:
     message_until = time.time() + 2.5
     show_help = False
     show_cameras = False
+    camera_list_cache: list[dict] = []
     running = True
+    last_seq = -1
+    last_raw: np.ndarray | None = None
+    dirty = True
+    overlay_was = True
+    clock = pygame.time.Clock()
+    tick_hz = 60 if cam_fps >= 50 else 30
+
+    def reopen(new_cap: cv2.VideoCapture, new_device: str) -> None:
+        nonlocal cap, device, grabber, last_seq, last_raw, dirty, cam_w, cam_h
+        grabber.stop()
+        cap.release()
+        cap = new_cap
+        device = new_device
+        grabber = FrameGrabber(cap)
+        last_seq = -1
+        last_raw = None
+        dirty = True
+        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     try:
         while running:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                time.sleep(0.05)
-                continue
-
-            original = rotate_frame(frame, rotation)
-            screen_w, screen_h = screen.size
-            display = fit_to_screen(original, screen_w, screen_h, fit_mode)
-
-            if show_cameras:
-                lines = []
-                for item in list_video_devices():
-                    if item["skip"] and not item["capture"]:
-                        continue
-                    mark = ">" if item["path"] == device else " "
-                    kind = "USB" if item["usb"] else ("CAP" if item["capture"] else "meta")
-                    name = item["name"][:40]
-                    lines.append(f"{mark} {item['path']}  {kind}  {name}")
-                if not lines:
-                    lines = ["brak kamer USB", "v4l2-ctl --list-devices"]
-                lines.append("m = nastepna   l = schowaj")
-                draw_text_block(display, lines, "Kamery")
-            elif show_help:
-                draw_text_block(display, HELP_LINES, "Skroty")
-            elif time.time() < message_until and message:
-                draw_text_block(display, [message])
-
-            screen.show(display)
-
             for action in poll_actions():
                 if action == "quit":
                     running = False
@@ -549,43 +642,78 @@ def main() -> int:
                 if action == "fullscreen":
                     fullscreen = not fullscreen
                     screen.set_fullscreen(fullscreen)
+                    dirty = True
                 elif action == "rotate":
                     rotation = (rotation + 1) % 4
                     message, message_until = f"obrot {rotation * 90}", time.time() + 1.5
+                    dirty = True
                 elif action == "fit":
                     fit_mode = FIT_MODES[(FIT_MODES.index(fit_mode) + 1) % len(FIT_MODES)]
                     message, message_until = f"fit {fit_mode}", time.time() + 1.5
+                    dirty = True
                 elif action == "snap":
-                    path = save_snapshot(original, args.snapshots)
-                    message, message_until = f"zapis {path}", time.time() + 2.0
+                    if last_raw is not None:
+                        path = save_snapshot(rotate_frame(last_raw, rotation), args.snapshots)
+                        message, message_until = f"zapis {path}", time.time() + 2.0
+                        dirty = True
                 elif action == "help":
                     show_help = not show_help
                     show_cameras = False
+                    dirty = True
                 elif action == "list":
                     show_cameras = not show_cameras
                     show_help = False
+                    if show_cameras:
+                        camera_list_cache = list_video_devices()
+                    dirty = True
                 elif action in ("res_down", "res_up"):
                     width, height = next_preset(width, height, -1 if action == "res_down" else 1)
-                    cap.release()
-                    cap, device = find_camera([device], width, height, fps, use_mjpeg)
+                    new_cap, new_device = find_camera([device], width, height, fps, use_mjpeg)
+                    reopen(new_cap, new_device)
                     message, message_until = f"{width}x{height}", time.time() + 1.5
                 elif action == "next":
                     devices = candidate_devices("")
                     if not devices:
                         message, message_until = "brak kamer", time.time() + 1.5
+                        dirty = True
                         continue
-                    cap.release()
                     device_index = (device_index + 1) % len(devices)
                     nxt = devices[device_index]
                     try:
-                        cap, device = find_camera([nxt], width, height, fps, use_mjpeg)
-                        message, message_until = f"{device}", time.time() + 1.5
+                        new_cap, new_device = find_camera([nxt], width, height, fps, use_mjpeg)
                     except RuntimeError:
-                        cap, device = find_camera(devices, width, height, fps, use_mjpeg)
-                        message, message_until = f"{device}", time.time() + 1.5
+                        new_cap, new_device = find_camera(devices, width, height, fps, use_mjpeg)
+                    reopen(new_cap, new_device)
+                    message, message_until = f"{device}", time.time() + 1.5
+
+            seq, frame = grabber.get_if_new(last_seq)
+            if frame is not None:
+                last_seq = seq
+                last_raw = frame
+                dirty = True
+
+            overlay_now = show_cameras or show_help or (time.time() < message_until and bool(message))
+            if overlay_now != overlay_was:
+                dirty = True
+                overlay_was = overlay_now
+
+            if dirty and last_raw is not None:
+                original = rotate_frame(last_raw, rotation)
+                display = scaler.apply(original, screen.size[0], screen.size[1], fit_mode)
+                if show_cameras:
+                    overlay_camera_list(display, camera_list_cache, device)
+                elif show_help:
+                    draw_text_block(display, HELP_LINES, "Skroty")
+                elif overlay_now and message:
+                    draw_text_block(display, [message])
+                screen.show(display)
+                dirty = False
+
+            clock.tick(tick_hz)
     except KeyboardInterrupt:
         pass
     finally:
+        grabber.stop()
         cap.release()
         screen.close()
     return 0
